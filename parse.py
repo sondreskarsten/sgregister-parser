@@ -1,22 +1,22 @@
-"""Parser entrypoint: raw JSONL.gz → pool + snapshots + changelog.
+"""Parser entrypoint: raw JSONL.gz → pool + firm_snapshots + area_snapshots + changelog.
 
 Reads today's raw artefact ``raw/{date}/enterprises.jsonl.gz``
-written by the collector, flattens each record, diffs against
-stored state, and emits the unified 12-col changelog plus updated
-``pool.parquet`` and ``snapshots.parquet``.
+written by the collector, flattens each record into firm + area
+rows, diffs against stored state, and emits the unified 12-col
+changelog plus updated ``pool.parquet``, ``firm_snapshots.parquet``,
+and ``area_snapshots.parquet``.
 
 This job runs airgapped — no external APIs. All input comes from
 ``gs://{GCS_BUCKET}/{GCS_PREFIX}/raw/{date}/``.
 
 Data flow
 ---------
-1. Sync existing ``state/pool.parquet`` + ``state/snapshots.parquet``
-   from GCS to local disk.
+1. Sync existing ``state/*.parquet`` from GCS to local disk.
 2. Download today's raw JSONL.gz from GCS to local disk.
-3. Flatten each record; compute content hash from the raw envelope.
+3. Flatten each record into firm row + area rows; dedup area rows.
 4. Run :meth:`StateManager.diff_and_build`.
-5. Write new pool, snapshots, and ``changelog/{date}.parquet``.
-6. Upload all three back to GCS.
+5. Write new pool, firm_snapshots, area_snapshots, ``changelog/{date}.parquet``.
+6. Upload all back to GCS.
 
 Environment variables
 ---------------------
@@ -39,7 +39,7 @@ import gzip
 import uuid
 from datetime import date
 
-from flatten import flatten_enterprise, content_hash
+from flatten import flatten
 from cdc import StateManager
 
 
@@ -58,11 +58,6 @@ def gcs_bucket():
 
 
 def download(gcs_path, local_path, bucket):
-    """Download a single GCS blob to a local path.
-
-    Returns ``True`` on successful download, ``False`` if the blob
-    does not exist (first run case).
-    """
     if bucket is None:
         return os.path.exists(local_path)
     blob = bucket.blob(gcs_path)
@@ -83,15 +78,13 @@ def upload(local_path, gcs_path, bucket):
 
 
 def sync_state_from_gcs(bucket):
-    """Pull pool + snapshots from GCS into ``STATE_DIR``."""
-    download(f"{GCS_PREFIX}/state/pool.parquet", os.path.join(STATE_DIR, "pool.parquet"), bucket)
-    download(f"{GCS_PREFIX}/state/snapshots.parquet", os.path.join(STATE_DIR, "snapshots.parquet"), bucket)
+    for name in ("pool.parquet", "firm_snapshots.parquet", "area_snapshots.parquet"):
+        download(f"{GCS_PREFIX}/state/{name}", os.path.join(STATE_DIR, name), bucket)
 
 
 def sync_state_to_gcs(bucket, run_date):
-    """Push pool + snapshots + today's changelog to GCS."""
-    upload(os.path.join(STATE_DIR, "pool.parquet"), f"{GCS_PREFIX}/state/pool.parquet", bucket)
-    upload(os.path.join(STATE_DIR, "snapshots.parquet"), f"{GCS_PREFIX}/state/snapshots.parquet", bucket)
+    for name in ("pool.parquet", "firm_snapshots.parquet", "area_snapshots.parquet"):
+        upload(os.path.join(STATE_DIR, name), f"{GCS_PREFIX}/state/{name}", bucket)
     upload(
         os.path.join(STATE_DIR, "changelog", f"{run_date}.parquet"),
         f"{GCS_PREFIX}/cdc/changelog/{run_date}.parquet",
@@ -100,20 +93,6 @@ def sync_state_to_gcs(bucket, run_date):
 
 
 def read_raw_jsonl(run_date, bucket):
-    """Load today's raw JSONL.gz from GCS (or local) and return records.
-
-    Parameters
-    ----------
-    run_date : str
-        ISO date.
-    bucket : google.cloud.storage.Bucket or None
-        Source bucket, or ``None`` for local-only mode.
-
-    Returns
-    -------
-    list of dict
-        Raw envelopes ``{"dibk-sgdata": {...}}``.
-    """
     local_path = os.path.join(STATE_DIR, "raw", run_date, "enterprises.jsonl.gz")
     if bucket is not None:
         download(f"{GCS_PREFIX}/raw/{run_date}/enterprises.jsonl.gz", local_path, bucket)
@@ -130,23 +109,30 @@ def read_raw_jsonl(run_date, bucket):
 
 
 def flatten_all(records):
-    """Flatten raw envelopes and attach content hashes.
+    """Flatten raw envelopes into firm rows + area rows.
 
-    Returns a list of flat dicts each with a ``content_hash`` key.
-    Records missing an orgnr are skipped.
+    Returns
+    -------
+    tuple
+        ``(firm_rows, area_rows, dup_conflicts)`` — firm_rows is one
+        row per record with a valid orgnr, area_rows is the flat
+        union of all area rows, dup_conflicts counts records that
+        had field-level conflicts between deduped area rows.
     """
-    out = []
+    firm_rows = []
+    area_rows = []
+    dup_conflicts = 0
     for rec in records:
-        flat = flatten_enterprise(rec)
-        if not flat.get("orgnr"):
+        firm, areas, conflicts = flatten(rec)
+        if not firm.get("orgnr"):
             continue
-        flat["content_hash"] = content_hash(rec)
-        out.append(flat)
-    return out
+        firm_rows.append(firm)
+        area_rows.extend(areas)
+        dup_conflicts += conflicts
+    return firm_rows, area_rows, dup_conflicts
 
 
 def run():
-    """Execute one parse run for ``RUN_DATE``."""
     run_id = str(uuid.uuid4())
     print(f"[{RUN_DATE}] sgregister-parser run_id={run_id} mode={RUN_MODE}", flush=True)
 
@@ -158,19 +144,20 @@ def run():
     records = read_raw_jsonl(RUN_DATE, bucket)
     print(f"  raw records: {len(records)}", flush=True)
 
-    flat_records = flatten_all(records)
-    print(f"  flattened with orgnr: {len(flat_records)}", flush=True)
+    firm_rows, area_rows, dup_conflicts = flatten_all(records)
+    print(f"  firm rows: {len(firm_rows)}  area rows (deduped): {len(area_rows)}  dup_conflicts: {dup_conflicts}", flush=True)
 
     state = StateManager(STATE_DIR)
-    changelog_rows = state.diff_and_build(flat_records, RUN_DATE, run_id, RUN_MODE)
+    changelog_rows = state.diff_and_build(firm_rows, area_rows, RUN_DATE, run_id, RUN_MODE)
 
-    summary = {}
+    by_kind = {}
     for row in changelog_rows:
-        summary[row["event_type"]] = summary.get(row["event_type"], 0) + 1
-    print(f"  events: {summary}", flush=True)
+        key = (row["event_subtype"], row["event_type"])
+        by_kind[key] = by_kind.get(key, 0) + 1
+    print(f"  events: {dict(sorted(by_kind.items()))}", flush=True)
 
     paths = state.save(changelog_rows, RUN_DATE)
-    print(f"  wrote snapshots={paths['snapshots_rows']} pool={paths['pool_rows']} changelog={paths['changelog_rows']}", flush=True)
+    print(f"  wrote firm={paths['firm_rows']} area={paths['area_rows']} pool={paths['pool_rows']} changelog={paths['changelog_rows']}", flush=True)
 
     sync_state_to_gcs(bucket, RUN_DATE)
     print("done.", flush=True)

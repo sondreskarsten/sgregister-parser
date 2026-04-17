@@ -1,37 +1,49 @@
-"""Parquet state management for SGregister CDC.
+"""Parquet state management for SGregister CDC (two-LUAS design).
 
-Maintains three output families on disk (synced to/from GCS by the
-entrypoint):
+Two snapshot tables, one pool, one unified 12-col changelog.
 
-* ``state/pool.parquet`` — one row per orgnr ever observed with
-  central approval. Accumulating: rows are never removed. Tracks
-  first/last-seen timestamps and counts of appearances and gaps.
-* ``state/snapshots.parquet`` — one row per orgnr currently in the
-  approval universe. Overwritten each run. Carries the flattened
-  30-field representation plus ``content_hash``, ``first_seen``,
-  ``last_seen``.
-* ``cdc/changelog/{date}.parquet`` — one file per run_date, unified
-  12-column schema matching the platform contract.
+Layout
+------
+``state/pool.parquet``
+    One row per orgnr ever seen. Accumulating. Tracks firm lifecycle
+    (first_seen, last_seen, currently_in_universe, n_appearances,
+    n_gaps).
 
-Change detection
-----------------
-For every orgnr present in today's raw dump:
+``state/firm_snapshots.parquet``
+    **LUAS = orgnr.** One row per currently-approved firm. Identity,
+    contact, address, status, terms.
 
-* **new** — orgnr not present in ``pool.parquet``.
-* **reappeared** — orgnr in pool but not in yesterday's snapshots
-  (it disappeared at some point and is now back).
-* **modified** — orgnr in yesterday's snapshots and today's, with
-  differing ``content_hash``.
-* no event — orgnr in both with matching hash.
+``state/area_snapshots.parquet``
+    **LUAS = (orgnr, function_xml, subject_area_xml).** One row per
+    approval scope currently held. ``grade`` and ``pbl`` are tracked
+    attributes; a grade change is a ``modified`` event at area grain.
 
-For orgnrs in yesterday's snapshots but not today's raw dump:
+``cdc/changelog/{date}.parquet``
+    Unified 12-col. ``event_subtype`` is ``firm`` or ``area`` —
+    downstream consumers can slice by grain. ``document_id`` is
+    ``orgnr`` for firm events, ``orgnr|function_xml|subject_area_xml``
+    for area events. ``orgnr`` is always the firm's orgnr, matching
+    the platform's one-hop slicing convention.
 
-* **disappeared** — orgnr lost approval. Emitted once at the
-  disappearance boundary; pool row is marked with an incremented
-  ``n_gaps``.
+Event semantics
+---------------
+Firm events (event_subtype='firm'):
+    ``new``        — orgnr not in pool
+    ``reappeared`` — orgnr in pool but absent from yesterday's firm_snapshots
+    ``modified``   — firm content_hash differs between runs
+    ``disappeared``— orgnr missing from today's raw dump
 
-``details_json`` carries the full current and previous flat records
-plus a structured ``delta`` for ``modified`` events.
+Area events (event_subtype='area'):
+    ``new``        — area LUAS not present for this orgnr yesterday
+                     (fires both when firm is new and when an existing
+                     firm gains a scope)
+    ``modified``   — area content_hash differs (typically grade change)
+    ``disappeared``— area LUAS present yesterday, absent today (scope
+                     removed — can happen without the firm disappearing)
+
+A firm disappearing also emits disappeared events for every area
+the firm previously held, so area-level deterioration signals stay
+complete regardless of firm-level events.
 """
 
 import os
@@ -42,7 +54,16 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-SNAPSHOTS_SCHEMA = pa.schema([
+POOL_SCHEMA = pa.schema([
+    ("orgnr", pa.string()),
+    ("first_seen", pa.string()),
+    ("last_seen", pa.string()),
+    ("currently_in_universe", pa.bool_()),
+    ("n_appearances_total", pa.int32()),
+    ("n_gaps", pa.int32()),
+])
+
+FIRM_SNAPSHOTS_SCHEMA = pa.schema([
     ("orgnr", pa.string()),
     ("name", pa.string()),
     ("phone", pa.string()),
@@ -69,20 +90,23 @@ SNAPSHOTS_SCHEMA = pa.schema([
     ("industrial_injury_insurance", pa.bool_()),
     ("educational_enterprise_approved", pa.bool_()),
     ("n_approval_areas", pa.int32()),
-    ("approval_areas_json", pa.large_string()),
-    ("approval_area_codes", pa.list_(pa.string())),
     ("content_hash", pa.string()),
     ("first_seen", pa.string()),
     ("last_seen", pa.string()),
 ])
 
-POOL_SCHEMA = pa.schema([
+AREA_SNAPSHOTS_SCHEMA = pa.schema([
     ("orgnr", pa.string()),
+    ("function_xml", pa.string()),
+    ("subject_area_xml", pa.string()),
+    ("function", pa.string()),
+    ("subject_area", pa.string()),
+    ("pbl", pa.string()),
+    ("pbl_xml", pa.string()),
+    ("grade", pa.string()),
+    ("content_hash", pa.string()),
     ("first_seen", pa.string()),
     ("last_seen", pa.string()),
-    ("currently_in_universe", pa.bool_()),
-    ("n_appearances_total", pa.int32()),
-    ("n_gaps", pa.int32()),
 ])
 
 CHANGELOG_SCHEMA = pa.schema([
@@ -101,88 +125,75 @@ CHANGELOG_SCHEMA = pa.schema([
 ])
 
 
-_NON_DIFF_FIELDS = {"content_hash", "first_seen", "last_seen"}
+_FIRM_NON_DIFF = {"content_hash", "first_seen", "last_seen"}
+_AREA_NON_DIFF = {"content_hash", "first_seen", "last_seen", "orgnr", "function_xml", "subject_area_xml"}
+_AREA_KEY_COLS = ("function_xml", "subject_area_xml")
 
 
 def _utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _compute_delta(old_flat, new_flat):
-    """Return structured delta + list of changed field names.
-
-    Parameters
-    ----------
-    old_flat : dict
-        Previous snapshot row (with or without ``content_hash`` etc).
-    new_flat : dict
-        New snapshot row.
-
-    Returns
-    -------
-    tuple
-        ``(delta, changed_fields)`` where ``delta`` is a dict with
-        ``old_values``, ``new_values``, ``areas_added``,
-        ``areas_removed`` and ``changed_fields`` is a sorted list of
-        top-level field names that differ.
-    """
+def _firm_delta(old, new):
+    """Structured delta + changed-field list for a firm row."""
     changed = []
     old_vals = {}
     new_vals = {}
-    for k in new_flat.keys():
-        if k in _NON_DIFF_FIELDS:
+    for k in new.keys():
+        if k in _FIRM_NON_DIFF:
             continue
-        if old_flat.get(k) != new_flat.get(k):
+        if old.get(k) != new.get(k):
             changed.append(k)
-            old_vals[k] = old_flat.get(k)
-            new_vals[k] = new_flat.get(k)
-
-    old_codes = set(old_flat.get("approval_area_codes") or [])
-    new_codes = set(new_flat.get("approval_area_codes") or [])
-    delta = {
-        "old_values": old_vals,
-        "new_values": new_vals,
-        "areas_added": sorted(new_codes - old_codes),
-        "areas_removed": sorted(old_codes - new_codes),
-    }
-    return delta, sorted(changed)
+            old_vals[k] = old.get(k)
+            new_vals[k] = new.get(k)
+    return {"old_values": old_vals, "new_values": new_vals}, sorted(changed)
 
 
-def _summary_for_modified(changed_fields, delta):
-    """Short human-readable summary for a modified event."""
-    parts = []
-    added = delta.get("areas_added") or []
-    removed = delta.get("areas_removed") or []
-    if added:
-        parts.append(f"+{len(added)} areas")
-    if removed:
-        parts.append(f"-{len(removed)} areas")
-    if "approval_period_to" in changed_fields:
-        old = delta["old_values"].get("approval_period_to")
-        new = delta["new_values"].get("approval_period_to")
-        parts.append(f"period {old}→{new}")
-    for flag in ("liability_insurance", "industrial_injury_insurance", "educational_enterprise_approved"):
-        if flag in changed_fields:
-            parts.append(flag)
-    if not parts:
-        parts.append(f"{len(changed_fields)} fields changed")
-    return "modified: " + ", ".join(parts)
+def _area_delta(old, new):
+    """Structured delta + changed-field list for an area row."""
+    changed = []
+    old_vals = {}
+    new_vals = {}
+    for k in new.keys():
+        if k in _AREA_NON_DIFF:
+            continue
+        if old.get(k) != new.get(k):
+            changed.append(k)
+            old_vals[k] = old.get(k)
+            new_vals[k] = new.get(k)
+    return {"old_values": old_vals, "new_values": new_vals}, sorted(changed)
+
+
+def _firm_summary(event_type, row, changed_fields=None):
+    name = row.get("name") or row.get("orgnr")
+    if event_type == "new":
+        return f"new SG approval: {name}"
+    if event_type == "reappeared":
+        return f"SG reapproved: {name}"
+    if event_type == "disappeared":
+        return f"SG lapsed or revoked: {name}"
+    if event_type == "modified":
+        return f"firm modified: {', '.join(changed_fields or [])}"
+    return event_type
+
+
+def _area_summary(event_type, row, changed_fields=None, delta=None):
+    label = f"{row.get('function') or row.get('function_xml')} × {row.get('subject_area') or row.get('subject_area_xml')} (grade {row.get('grade')})"
+    if event_type == "new":
+        return f"area added: {label}"
+    if event_type == "disappeared":
+        return f"area removed: {label}"
+    if event_type == "modified":
+        if delta and "grade" in (changed_fields or []):
+            old_g = delta["old_values"].get("grade")
+            new_g = delta["new_values"].get("grade")
+            return f"grade change: {row.get('function') or row.get('function_xml')} × {row.get('subject_area') or row.get('subject_area_xml')} grade {old_g}→{new_g}"
+        return f"area modified ({', '.join(changed_fields or [])}): {label}"
+    return event_type
 
 
 class StateManager:
-    """Parquet state manager for SGregister CDC.
-
-    Parameters
-    ----------
-    state_dir : str
-        Local working directory. Expected layout::
-
-            state_dir/
-                pool.parquet
-                snapshots.parquet
-                changelog/
-                    YYYY-MM-DD.parquet
-    """
+    """Parquet state manager for SGregister CDC (two-LUAS)."""
 
     DATA_SOURCE = "sgregister"
 
@@ -192,37 +203,41 @@ class StateManager:
         os.makedirs(os.path.join(state_dir, "changelog"), exist_ok=True)
 
         self._pool_path = os.path.join(state_dir, "pool.parquet")
-        self._snap_path = os.path.join(state_dir, "snapshots.parquet")
+        self._firm_path = os.path.join(state_dir, "firm_snapshots.parquet")
+        self._area_path = os.path.join(state_dir, "area_snapshots.parquet")
 
         self._pool = self._read_or_empty(self._pool_path, POOL_SCHEMA)
-        self._snap = self._read_or_empty(self._snap_path, SNAPSHOTS_SCHEMA)
+        self._firm = self._read_or_empty(self._firm_path, FIRM_SNAPSHOTS_SCHEMA)
+        self._area = self._read_or_empty(self._area_path, AREA_SNAPSHOTS_SCHEMA)
 
     def _read_or_empty(self, path, schema):
         if os.path.exists(path):
             return pq.read_table(path)
         return pa.table({name: [] for name in schema.names}, schema=schema)
 
-    def _snap_by_orgnr(self):
-        """Return dict orgnr → flat dict for the current snapshot table."""
-        df = self._snap.to_pylist()
-        return {row["orgnr"]: row for row in df}
+    def _firm_by_orgnr(self):
+        return {r["orgnr"]: r for r in self._firm.to_pylist()}
+
+    def _area_by_luas(self):
+        return {(r["orgnr"], r["function_xml"], r["subject_area_xml"]): r
+                for r in self._area.to_pylist()}
 
     def _pool_by_orgnr(self):
-        df = self._pool.to_pylist()
-        return {row["orgnr"]: row for row in df}
+        return {r["orgnr"]: r for r in self._pool.to_pylist()}
 
-    def diff_and_build(self, flat_records, run_date, run_id, run_mode):
-        """Compute events, rebuild snapshots, update pool.
+    def diff_and_build(self, firm_rows, area_rows, run_date, run_id, run_mode):
+        """Compute firm + area events, rebuild snapshots, update pool.
 
         Parameters
         ----------
-        flat_records : list of dict
-            Flattened records from today's raw dump — one per
-            currently-approved orgnr. Each must include
-            ``content_hash``.
+        firm_rows : list of dict
+            Flat firm rows produced by :func:`flatten.flatten_firm`.
+            Each has a ``content_hash``.
+        area_rows : list of dict
+            Flat area rows produced by :func:`flatten.flatten_areas`.
+            Each has a ``content_hash``.
         run_date : str
-            ISO date string ``YYYY-MM-DD`` representing today's
-            observation date.
+            ISO ``YYYY-MM-DD``.
         run_id : str
             Per-execution UUID.
         run_mode : str
@@ -231,52 +246,50 @@ class StateManager:
         Returns
         -------
         list of dict
-            Unified 12-col changelog rows (may be empty).
+            Unified 12-col changelog rows (firm + area, interleaved
+            in computation order).
         """
         detected = _utc_now_iso()
         valid_time = f"{run_date}T00:00:00+00:00"
 
-        prev_snap = self._snap_by_orgnr()
+        prev_firm = self._firm_by_orgnr()
+        prev_area = self._area_by_luas()
         prev_pool = self._pool_by_orgnr()
 
-        today_orgnrs = {r["orgnr"] for r in flat_records}
-        prev_orgnrs = set(prev_snap.keys())
+        today_firm_orgnrs = {r["orgnr"] for r in firm_rows}
+        today_area_luas = {(r["orgnr"], r["function_xml"], r["subject_area_xml"]) for r in area_rows}
+        prev_firm_orgnrs = set(prev_firm.keys())
 
         changelog_rows = []
-        new_snap_rows = []
 
-        for rec in flat_records:
+        new_firm_rows = []
+        for rec in firm_rows:
             orgnr = rec["orgnr"]
-            old = prev_snap.get(orgnr)
+            old = prev_firm.get(orgnr)
             pool_row = prev_pool.get(orgnr)
 
             if old is None and pool_row is None:
                 event_type = "new"
-                summary = f"new SG approval: {rec.get('name')}"
-                delta = {"new_values": {k: v for k, v in rec.items() if k not in _NON_DIFF_FIELDS}}
+                delta = {"new_values": {k: v for k, v in rec.items() if k not in _FIRM_NON_DIFF}}
                 changed = sorted(delta["new_values"].keys())
                 first_seen = detected
             elif old is None and pool_row is not None:
                 event_type = "reappeared"
-                summary = f"SG reapproved: {rec.get('name')}"
-                delta = {"new_values": {k: v for k, v in rec.items() if k not in _NON_DIFF_FIELDS},
-                         "previously_seen_until": pool_row.get("last_seen")}
+                delta = {
+                    "new_values": {k: v for k, v in rec.items() if k not in _FIRM_NON_DIFF},
+                    "previously_seen_until": pool_row.get("last_seen"),
+                }
                 changed = sorted(delta["new_values"].keys())
                 first_seen = pool_row.get("first_seen") or detected
             elif old["content_hash"] == rec["content_hash"]:
                 event_type = None
                 first_seen = old.get("first_seen") or detected
             else:
-                delta, changed = _compute_delta(old, rec)
+                delta, changed = _firm_delta(old, rec)
                 event_type = "modified"
-                summary = _summary_for_modified(changed, delta)
                 first_seen = old.get("first_seen") or detected
 
-            new_snap_rows.append({
-                **rec,
-                "first_seen": first_seen,
-                "last_seen": detected,
-            })
+            new_firm_rows.append({**rec, "first_seen": first_seen, "last_seen": detected})
 
             if event_type is not None:
                 changelog_rows.append({
@@ -284,8 +297,8 @@ class StateManager:
                     "document_id": orgnr,
                     "data_source": self.DATA_SOURCE,
                     "event_type": event_type,
-                    "event_subtype": "update",
-                    "summary": summary,
+                    "event_subtype": "firm",
+                    "summary": _firm_summary(event_type, rec, changed),
                     "changed_fields": json.dumps(changed, ensure_ascii=False),
                     "valid_time": valid_time,
                     "detected_time": detected,
@@ -294,18 +307,19 @@ class StateManager:
                     "run_id": run_id,
                 })
 
-        disappeared_orgnrs = prev_orgnrs - today_orgnrs
-        for orgnr in disappeared_orgnrs:
-            old = prev_snap[orgnr]
-            delta = {"old_values": {k: v for k, v in old.items() if k not in _NON_DIFF_FIELDS},
-                     "last_seen": old.get("last_seen")}
+        for orgnr in prev_firm_orgnrs - today_firm_orgnrs:
+            old = prev_firm[orgnr]
+            delta = {
+                "old_values": {k: v for k, v in old.items() if k not in _FIRM_NON_DIFF},
+                "last_seen": old.get("last_seen"),
+            }
             changelog_rows.append({
                 "orgnr": orgnr,
                 "document_id": orgnr,
                 "data_source": self.DATA_SOURCE,
                 "event_type": "disappeared",
-                "event_subtype": "update",
-                "summary": f"SG lapsed or revoked: {old.get('name')}",
+                "event_subtype": "firm",
+                "summary": _firm_summary("disappeared", old),
                 "changed_fields": json.dumps(["approved"], ensure_ascii=False),
                 "valid_time": valid_time,
                 "detected_time": detected,
@@ -314,25 +328,84 @@ class StateManager:
                 "run_id": run_id,
             })
 
-        self._snap = pa.Table.from_pylist(new_snap_rows, schema=SNAPSHOTS_SCHEMA)
-        self._pool = self._rebuild_pool(prev_pool, today_orgnrs, disappeared_orgnrs, detected)
+        new_area_rows = []
+        for rec in area_rows:
+            luas = (rec["orgnr"], rec["function_xml"], rec["subject_area_xml"])
+            doc_id = "|".join(luas)
+            old = prev_area.get(luas)
+
+            if old is None:
+                event_type = "new"
+                delta = {"new_values": {k: v for k, v in rec.items() if k not in _AREA_NON_DIFF}}
+                changed = sorted(delta["new_values"].keys())
+                first_seen = detected
+            elif old["content_hash"] == rec["content_hash"]:
+                event_type = None
+                first_seen = old.get("first_seen") or detected
+            else:
+                delta, changed = _area_delta(old, rec)
+                event_type = "modified"
+                first_seen = old.get("first_seen") or detected
+
+            new_area_rows.append({**rec, "first_seen": first_seen, "last_seen": detected})
+
+            if event_type is not None:
+                changelog_rows.append({
+                    "orgnr": rec["orgnr"],
+                    "document_id": doc_id,
+                    "data_source": self.DATA_SOURCE,
+                    "event_type": event_type,
+                    "event_subtype": "area",
+                    "summary": _area_summary(event_type, rec, changed, delta if event_type == "modified" else None),
+                    "changed_fields": json.dumps(changed, ensure_ascii=False),
+                    "valid_time": valid_time,
+                    "detected_time": detected,
+                    "details_json": json.dumps(delta, ensure_ascii=False, sort_keys=True),
+                    "source_run_mode": run_mode,
+                    "run_id": run_id,
+                })
+
+        for luas in set(prev_area.keys()) - today_area_luas:
+            old = prev_area[luas]
+            delta = {
+                "old_values": {k: v for k, v in old.items() if k not in _AREA_NON_DIFF},
+                "last_seen": old.get("last_seen"),
+            }
+            doc_id = "|".join(luas)
+            changelog_rows.append({
+                "orgnr": old["orgnr"],
+                "document_id": doc_id,
+                "data_source": self.DATA_SOURCE,
+                "event_type": "disappeared",
+                "event_subtype": "area",
+                "summary": _area_summary("disappeared", old),
+                "changed_fields": json.dumps(["grade"], ensure_ascii=False),
+                "valid_time": valid_time,
+                "detected_time": detected,
+                "details_json": json.dumps(delta, ensure_ascii=False, sort_keys=True),
+                "source_run_mode": run_mode,
+                "run_id": run_id,
+            })
+
+        self._firm = pa.Table.from_pylist(new_firm_rows, schema=FIRM_SNAPSHOTS_SCHEMA)
+        self._area = pa.Table.from_pylist(new_area_rows, schema=AREA_SNAPSHOTS_SCHEMA)
+        disappeared_firm_orgnrs = prev_firm_orgnrs - today_firm_orgnrs
+        self._pool = self._rebuild_pool(prev_pool, today_firm_orgnrs, disappeared_firm_orgnrs, detected)
 
         return changelog_rows
 
     def _rebuild_pool(self, prev_pool, today_orgnrs, disappeared_orgnrs, detected):
-        """Recompute the pool table from prior pool + today's membership."""
         pool_rows = []
         seen = set()
-
         for orgnr, row in prev_pool.items():
             was_in_universe = bool(row.get("currently_in_universe"))
             in_today = orgnr in today_orgnrs
             just_disappeared = orgnr in disappeared_orgnrs
             n_gaps = int(row.get("n_gaps") or 0)
-            n_appearances = int(row.get("n_appearances_total") or 0)
+            n_app = int(row.get("n_appearances_total") or 0)
             if in_today:
                 if not was_in_universe:
-                    n_appearances += 1
+                    n_app += 1
                 last_seen = detected
             else:
                 if just_disappeared:
@@ -343,11 +416,10 @@ class StateManager:
                 "first_seen": row.get("first_seen") or detected,
                 "last_seen": last_seen,
                 "currently_in_universe": in_today,
-                "n_appearances_total": n_appearances,
+                "n_appearances_total": n_app,
                 "n_gaps": n_gaps,
             })
             seen.add(orgnr)
-
         for orgnr in sorted(today_orgnrs - seen):
             pool_rows.append({
                 "orgnr": orgnr,
@@ -357,29 +429,23 @@ class StateManager:
                 "n_appearances_total": 1,
                 "n_gaps": 0,
             })
-
         return pa.Table.from_pylist(pool_rows, schema=POOL_SCHEMA)
 
     def save(self, changelog_rows, run_date):
-        """Persist snapshots, pool, and today's changelog to disk.
-
-        Parameters
-        ----------
-        changelog_rows : list of dict
-            Rows produced by :meth:`diff_and_build`.
-        run_date : str
-            ISO date used to name the changelog file.
-        """
-        pq.write_table(self._snap, self._snap_path, compression="zstd")
+        """Persist firm + area snapshots, pool, and changelog."""
+        pq.write_table(self._firm, self._firm_path, compression="zstd")
+        pq.write_table(self._area, self._area_path, compression="zstd")
         pq.write_table(self._pool, self._pool_path, compression="zstd")
         cl_path = os.path.join(self.state_dir, "changelog", f"{run_date}.parquet")
         cl_table = pa.Table.from_pylist(changelog_rows, schema=CHANGELOG_SCHEMA)
         pq.write_table(cl_table, cl_path, compression="zstd")
         return {
-            "snapshots_path": self._snap_path,
+            "firm_snapshots_path": self._firm_path,
+            "area_snapshots_path": self._area_path,
             "pool_path": self._pool_path,
             "changelog_path": cl_path,
-            "snapshots_rows": self._snap.num_rows,
+            "firm_rows": self._firm.num_rows,
+            "area_rows": self._area.num_rows,
             "pool_rows": self._pool.num_rows,
             "changelog_rows": cl_table.num_rows,
         }

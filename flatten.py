@@ -1,60 +1,38 @@
-"""Flatten SGregister enterprise envelopes into parquet-friendly rows.
+"""Flatten SGregister enterprise envelopes into firm + area tables.
 
-Each record from ``/api/enterprises/{orgnr}`` is a single-object
-envelope ``{"dibk-sgdata": {...}}`` with four children: ``enterprise``,
-``status``, ``additional_terms``, ``valid_approval_areas[]``.
+Two LUAS, two output tables:
 
-This module produces:
+* **Firm LUAS = orgnr.** One row per legal entity. Carries identity,
+  contact, address, approval period, terms.
+* **Area LUAS = (orgnr, function_xml, subject_area_xml).** Many rows
+  per firm, one per approval scope. Carries grade (the deterioration
+  signal), plus pbl/pbl_xml/function/subject_area as attributes
+  (pbl is empirically constant at "PBL 2016" in April 2026 but
+  tracked so any future PBL revision surfaces as a regular attribute
+  change rather than silently overwriting).
 
-* :func:`flatten_enterprise` — flat dict with 30 scalar columns plus
-  a JSON-serialised ``approval_areas_json`` and a sorted list of
-  canonical ``approval_area_codes``. Suitable for one row in
-  ``snapshots.parquet``.
-* :func:`content_hash` — deterministic SHA-256[:16] over the
-  canonical JSON of the full envelope. Used for change detection.
-
-The "canonical approval area code" is the string
-``"{function_xml}-{subject_area_xml}-{grade}"``. Sorting this list
-gives a stable representation that reveals area additions, removals,
-and grade changes without descending into the nested objects.
+Area-row dedup
+--------------
+Empirically ~1% of firms return exact-duplicate area rows in
+``valid_approval_areas[]`` (same function_xml, same subject_area_xml,
+same pbl, same grade — data-entry artefact on the DiBK side). This
+module dedupes on ``(function_xml, subject_area_xml)``; if two rows
+with the same LUAS disagree on any field, the first occurrence wins
+and the conflict count is surfaced via ``dup_conflicts``.
 """
 
 import hashlib
 import json
 
 
-def content_hash(record):
-    """Compute a truncated SHA-256 hash of an SGregister envelope.
-
-    Parameters
-    ----------
-    record : dict
-        Raw envelope as returned by the API: ``{"dibk-sgdata": {...}}``.
-
-    Returns
-    -------
-    str
-        First 16 hexadecimal characters of the SHA-256 digest of the
-        canonical JSON serialisation (sorted keys, no ASCII escaping).
-    """
-    canonical = json.dumps(record, sort_keys=True, ensure_ascii=False)
+def content_hash(obj):
+    """Truncated SHA-256 over canonical JSON (sorted keys, unicode-safe)."""
+    canonical = json.dumps(obj, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
-def _area_code(area):
-    """Canonical ``"function_xml-subject_area_xml-grade"`` code.
-
-    Missing parts render as empty strings.
-    """
-    return "{}-{}-{}".format(
-        area.get("function_xml") or "",
-        area.get("subject_area_xml") or "",
-        area.get("grade") or "",
-    )
-
-
-def flatten_enterprise(record):
-    """Flatten an SGregister envelope into a flat dict.
+def flatten_firm(record):
+    """Flatten firm-level fields from an SGregister envelope.
 
     Parameters
     ----------
@@ -65,9 +43,9 @@ def flatten_enterprise(record):
     Returns
     -------
     dict
-        Flat dict with 30 scalar keys plus ``approval_areas_json``
-        (full nested list as JSON string) and ``approval_area_codes``
-        (sorted list of canonical codes).
+        Flat dict with 26 attribute keys plus ``content_hash`` (over
+        attribute keys only — area-level changes do not bump this
+        hash).
     """
     data = record.get("dibk-sgdata") or {}
     ent = data.get("enterprise") or {}
@@ -77,9 +55,7 @@ def flatten_enterprise(record):
     terms = data.get("additional_terms") or {}
     areas = data.get("valid_approval_areas") or []
 
-    codes = sorted({_area_code(a) for a in areas})
-
-    return {
+    firm = {
         "orgnr": ent.get("organizational_number"),
         "name": ent.get("name"),
         "phone": ent.get("phone"),
@@ -106,6 +82,57 @@ def flatten_enterprise(record):
         "industrial_injury_insurance": terms.get("industrial_injury_insurance"),
         "educational_enterprise_approved": terms.get("educational_enterprise_approved"),
         "n_approval_areas": len(areas),
-        "approval_areas_json": json.dumps(areas, ensure_ascii=False, sort_keys=True),
-        "approval_area_codes": codes,
     }
+    firm["content_hash"] = content_hash({k: v for k, v in firm.items()})
+    return firm
+
+
+def flatten_areas(record):
+    """Flatten area rows, deduped on (function_xml, subject_area_xml).
+
+    Parameters
+    ----------
+    record : dict
+        Raw envelope ``{"dibk-sgdata": {...}}``.
+
+    Returns
+    -------
+    tuple
+        ``(rows, dup_conflicts)`` where ``rows`` is a list of deduped
+        flat area dicts and ``dup_conflicts`` is the number of
+        duplicate keys where fields differed between rows collapsed
+        into one. A non-zero conflict count is worth logging.
+    """
+    data = record.get("dibk-sgdata") or {}
+    ent = data.get("enterprise") or {}
+    orgnr = ent.get("organizational_number")
+    areas = data.get("valid_approval_areas") or []
+
+    seen = {}
+    conflicts = 0
+    for a in areas:
+        key = (a.get("function_xml"), a.get("subject_area_xml"))
+        row = {
+            "orgnr": orgnr,
+            "function_xml": a.get("function_xml"),
+            "subject_area_xml": a.get("subject_area_xml"),
+            "function": a.get("function"),
+            "subject_area": a.get("subject_area"),
+            "pbl": a.get("pbl"),
+            "pbl_xml": a.get("pbl_xml"),
+            "grade": a.get("grade"),
+        }
+        row["content_hash"] = content_hash(row)
+        if key in seen:
+            if seen[key]["content_hash"] != row["content_hash"]:
+                conflicts += 1
+            continue
+        seen[key] = row
+    return list(seen.values()), conflicts
+
+
+def flatten(record):
+    """Convenience wrapper returning firm + area rows + dup conflict count."""
+    firm = flatten_firm(record)
+    areas, conflicts = flatten_areas(record)
+    return firm, areas, conflicts
